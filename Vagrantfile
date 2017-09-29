@@ -2,6 +2,7 @@
 # # vi: set ft=ruby :
 
 require 'fileutils'
+require_relative 'util.rb'
 
 Vagrant.require_version ">= 1.6.0"
 
@@ -24,15 +25,21 @@ CONFIG = File.join(File.dirname(__FILE__), "config.rb")
 
 # Defaults for config options defined in CONFIG
 $num_instances = 1
+$num_big_instances = 0
 $instance_name_prefix = "core"
 $enable_serial_logging = false
 $share_home = false
 $vm_gui = false
 $vm_memory = 1024
 $vm_cpus = 1
+$vm_big_memory = 8192
+$vm_big_cpus = 2
 $vb_cpuexecutioncap = 100
 $shared_folders = {}
 $forwarded_ports = {}
+$update_channel = "alpha"
+$node_disks = 0
+$disk_size = 10
 
 # Attempt to apply the deprecated environment variable NUM_INSTANCES to
 # $num_instances while allowing config.rb to override it
@@ -49,11 +56,17 @@ def vm_gui
   $vb_gui.nil? ? $vm_gui : $vb_gui
 end
 
-def vm_memory
+def vm_memory(instance)
+  if instance > $num_instances then
+    return $vm_big_memory
+  end
   $vb_memory.nil? ? $vm_memory : $vb_memory
 end
 
-def vm_cpus
+def vm_cpus(instance)
+  if instance > $num_instances then
+    return $vm_big_cpus
+  end
   $vb_cpus.nil? ? $vm_cpus : $vb_cpus
 end
 
@@ -63,14 +76,12 @@ Vagrant.configure("2") do |config|
   # forward ssh agent to easily ssh into the different machines
   config.ssh.forward_agent = true
 
-  config.vm.box = "coreos-alpha"
-  config.vm.box_url = "https://alpha.release.core-os.net/amd64-usr/current/coreos_production_vagrant_virtualbox.json"
+  config.vm.box = "coreos-%s" % $update_channel
+  config.vm.box_url = "https://%s.release.core-os.net/amd64-usr/current/coreos_production_vagrant_virtualbox.json" % $update_channel
 
-  ["vmware_fusion", "vmware_workstation"].each do |vmware|
-    config.vm.provider vmware do |v, override|
-      override.vm.box_url = "https://alpha.release.core-os.net/amd64-usr/current/coreos_production_vagrant_vmware_fusion.json"
-    end
-  end
+  # Note: Having VirtualBox be the first config.vm.provider means
+  # it will be the default provider.  For details on this see:
+  #   https://www.vagrantup.com/docs/providers/basic_usage.html
 
   config.vm.provider :virtualbox do |v|
     # On VirtualBox, we don't have guest additions or a functional vboxsf
@@ -81,12 +92,23 @@ Vagrant.configure("2") do |config|
     config.ignition.enabled = true
   end
 
+  ["vmware_fusion", "vmware_workstation"].each do |vmware|
+    config.vm.provider vmware do |v, override|
+      override.vm.box_url = "https://%s.release.core-os.net/amd64-usr/current/coreos_production_vagrant_vmware_fusion.json" % $update_channel
+    end
+  end
+
+  config.vm.provider :parallels do |v, override|
+    override.vm.box_url = "http://%s.release.core-os.net/amd64-usr/current/coreos_production_vagrant_parallels.json" % $update_channel
+  end
+
   # plugin conflict
   if Vagrant.has_plugin?("vagrant-vbguest") then
     config.vbguest.auto_update = false
   end
 
-  (1..$num_instances).each do |i|
+  total_instances=$num_instances+$num_big_instances
+  (1..total_instances).each do |i|
     config.vm.define vm_name = "%s-%02d" % [$instance_name_prefix, i] do |config|
       config.vm.hostname = vm_name
 
@@ -120,20 +142,26 @@ Vagrant.configure("2") do |config|
         config.vm.network "forwarded_port", guest: guest, host: host, auto_correct: true
       end
 
+      config.vm.provider :virtualbox do |vb|
+        vb.gui = vm_gui
+        vb.memory = vm_memory i
+        vb.cpus = vm_cpus i
+        vb.customize ["modifyvm", :id, "--cpuexecutioncap", "#{$vb_cpuexecutioncap}"]
+        config.ignition.config_obj = vb
+      end
+
       ["vmware_fusion", "vmware_workstation"].each do |vmware|
         config.vm.provider vmware do |v|
           v.gui = vm_gui
-          v.vmx['memsize'] = vm_memory
-          v.vmx['numvcpus'] = vm_cpus
+          v.vmx['memsize'] = vm_memory i
+          v.vmx['numvcpus'] = vm_cpus i
         end
       end
 
-      config.vm.provider :virtualbox do |vb|
-        vb.gui = vm_gui
-        vb.memory = vm_memory
-        vb.cpus = vm_cpus
-        vb.customize ["modifyvm", :id, "--cpuexecutioncap", "#{$vb_cpuexecutioncap}"]
-        config.ignition.config_obj = vb
+      config.vm.provider :parallels do |vb|
+        vb.memory = vm_memory i
+        vb.cpus = vm_cpus i
+        vb.name = vm_name
       end
 
       ip = "172.17.8.#{i+100}"
@@ -166,6 +194,10 @@ Vagrant.configure("2") do |config|
         if File.exist?(IGNITION_CONFIG_PATH)
           config.ignition.path = 'config.ign'
         end
+      end
+
+      if $node_disks > 0
+        attach_volumes(config, $node_disks, $disk_size)
       end
     end
   end
